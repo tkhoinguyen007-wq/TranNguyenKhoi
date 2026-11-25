@@ -9,9 +9,11 @@ Bot Discord viết bằng **Python (`discord.py`)**, tích hợp **Gemini AI (`g
   - `/info` — Xem thông tin bot, thời gian uptime, số server và model AI đang dùng.
   - `/ask <câu hỏi> [image] [private]` — Hỏi Gemini AI trực tiếp, có thể đính kèm ảnh (PNG/JPG/WEBP/GIF) và chế độ chỉ mình bạn thấy.
   - `/reset` — Xóa ngữ cảnh hội thoại AI của bạn trong kênh hiện tại để bắt đầu cuộc trò chuyện mới.
+  - `/teach <nội dung>`, `/knowledge`, `/forget <id | all>` — Dạy, xem hoặc xóa kiến thức của bot (chỉ người có Role **`Người quản lí`** hoặc tài khoản **`_ngkhoi.9999`**).
   - `/help` — Hướng dẫn sử dụng các lệnh.
-- **Chat tự nhiên & Xem ảnh qua Mention / Reply / DM**:
+- **Chat tự nhiên, Xem ảnh & Cập nhật DM trực tuyến**:
   - Tag `@TenBot <câu hỏi>` kèm ảnh, **Reply vào một tin nhắn có ảnh** rồi tag `@TenBot`, hoặc nhắn trực tiếp (DM) để bot xem ảnh và trò chuyện liên tục nhiều lượt.
+  - Tài khoản **`_ngkhoi.9999`** có thể nhắn DM trực tiếp với cú pháp `dạy: <nội dung>`, `nhớ: <nội dung>`, `cập nhật: <nội dung>`, `xem kiến thức`, `quên: <id | all>` để cập nhật kiến thức trực tuyến tức thì.
 - **Sẵn sàng deploy 24/7**:
   - Tích hợp sẵn HTTP server tại `/` và `/health` trên cổng `$PORT` (mặc định `8080`) để các nền tảng PaaS (Render, Railway, Koyeb...) kiểm tra health-check.
 

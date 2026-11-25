@@ -15,12 +15,15 @@ from src.bot import (
     MAX_IMAGE_BYTES,
     build_stream_preview,
     format_uptime,
+    is_knowledge_manager,
     make_session_key,
+    parse_dm_knowledge_command,
     resolve_image_mime_type,
     strip_bot_mention,
 )
 from src.config import BotConfig
 from src.health import create_health_app
+from src.knowledge import KnowledgeStore
 from src.utils import split_message
 
 
@@ -328,6 +331,112 @@ async def test_gemini_chat_service_raises_when_unconfigured() -> None:
     assert service.is_configured is False
     with pytest.raises(GeminiNotConfiguredError):
         await service.ask("1:2", "hello")
+
+
+@pytest.mark.asyncio
+async def test_knowledge_store_persists_and_injects_into_gemini(tmp_path) -> None:
+    store_path = tmp_path / "knowledge.json"
+    store = KnowledgeStore(file_path=store_path)
+    entry = await store.add("Shop mở cửa từ 8h đến 22h mỗi ngày.", author="_ngkhoi.9999")
+    await store.add("Không nhận giao dịch ngoài server.", author="ModA")
+
+    reloaded = KnowledgeStore(file_path=store_path)
+    entries = reloaded.list_entries()
+    assert len(entries) == 2
+    assert entries[0].id == entry.id
+    assert "8h đến 22h" in reloaded.build_prompt_section()
+
+    fake_client = FakeGenAIClient()
+    service = GeminiChatService(
+        api_key=None,
+        model="gemini-3.5-flash-lite",
+        system_instruction="Base prompt.",
+        thinking_level="minimal",
+        knowledge_provider=reloaded.build_prompt_section,
+        client=fake_client,
+    )
+    await service.ask("k:1", "Mấy giờ mở cửa?")
+    sent_instruction = fake_client.aio.interactions.calls[0]["system_instruction"]
+    assert "Base prompt." in sent_instruction
+    assert "Shop mở cửa từ 8h đến 22h mỗi ngày." in sent_instruction
+
+    removed = await reloaded.remove(1)
+    assert removed is not None
+    assert len(reloaded.list_entries()) == 1
+    assert await reloaded.clear() == 1
+    assert reloaded.build_prompt_section() == ""
+
+
+def test_is_knowledge_manager_role_and_username() -> None:
+    config = BotConfig(
+        discord_token="dummy",
+        gemini_api_key=None,
+        gemini_model="gemini-3.5-flash-lite",
+        fallback_model="gemini-3.5-flash-lite",
+        thinking_level="minimal",
+        system_instruction="Be helpful.",
+        guild_id=None,
+        port=8080,
+    )
+
+    owner = SimpleNamespace(name="_ngkhoi.9999", display_name="Khoi", roles=[])
+    manager_member = SimpleNamespace(
+        name="someone_else",
+        display_name="Someone",
+        roles=[SimpleNamespace(name="  Người quản lí ")],
+    )
+    impersonator = SimpleNamespace(
+        name="random_user",
+        display_name="_ngkhoi.9999",
+        roles=[SimpleNamespace(name="Member")],
+    )
+    dm_stranger = SimpleNamespace(name="stranger", display_name="Stranger")
+
+    assert is_knowledge_manager(owner, config) is True
+    assert is_knowledge_manager(manager_member, config) is True
+    assert is_knowledge_manager(impersonator, config) is False
+    assert is_knowledge_manager(dm_stranger, config) is False
+
+
+def test_parse_dm_knowledge_command() -> None:
+    assert parse_dm_knowledge_command("dạy: Giá vé VIP là 50k") == ("add", "Giá vé VIP là 50k")
+    assert parse_dm_knowledge_command("Nhớ: Link web là example.com") == (
+        "add",
+        "Link web là example.com",
+    )
+    assert parse_dm_knowledge_command("cập nhật: Bảo trì lúc 2h sáng") == (
+        "add",
+        "Bảo trì lúc 2h sáng",
+    )
+    assert parse_dm_knowledge_command("!teach Quy định mới") == ("add", "Quy định mới")
+    assert parse_dm_knowledge_command("xem kiến thức") == ("list", "")
+    assert parse_dm_knowledge_command("!knowledge") == ("list", "")
+    assert parse_dm_knowledge_command("quên: 2") == ("remove", "2")
+    assert parse_dm_knowledge_command("!forget all") == ("remove", "all")
+    assert parse_dm_knowledge_command("Hôm nay trời đẹp quá") is None
+
+
+@pytest.mark.asyncio
+async def test_bot_execute_knowledge_command(tmp_path) -> None:
+    config = BotConfig(
+        discord_token="dummy",
+        gemini_api_key=None,
+        gemini_model="gemini-3.5-flash-lite",
+        fallback_model="gemini-3.5-flash-lite",
+        thinking_level="minimal",
+        system_instruction="Be helpful.",
+        guild_id=None,
+        port=8080,
+        knowledge_file=tmp_path / "bot_knowledge.json",
+    )
+    bot = DiscordGeminiBot(config=config)
+
+    add_msg = await bot._execute_knowledge_command("add", "Luật 1: Tôn trọng nhau", author="_ngkhoi.9999")
+    assert "#1" in add_msg
+    list_msg = await bot._execute_knowledge_command("list", "", author="_ngkhoi.9999")
+    assert "Luật 1: Tôn trọng nhau" in list_msg
+    del_msg = await bot._execute_knowledge_command("remove", "1", author="_ngkhoi.9999")
+    assert "Đã xóa kiến thức" in del_msg
 
 
 @pytest.mark.asyncio

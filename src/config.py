@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -26,6 +27,11 @@ class BotConfig:
     system_instruction: str
     guild_id: int | None
     port: int
+    manager_role_name: str = "Người quản lí"
+    manager_usernames: tuple[str, ...] = ("_ngkhoi.9999",)
+    knowledge_file: Path = Path("data/knowledge.json")
+    knowledge_gist_id: str | None = None
+    knowledge_github_token: str | None = None
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -61,6 +67,18 @@ class BotConfig:
         except ValueError as exc:
             raise ValueError("PORT must be a valid integer.") from exc
 
+        manager_role_name = os.getenv("MANAGER_ROLE_NAME", "Người quản lí").strip() or "Người quản lí"
+        raw_managers = os.getenv("KNOWLEDGE_MANAGER_USERNAMES", "_ngkhoi.9999").strip()
+        manager_usernames = tuple(
+            name.strip().lower() for name in raw_managers.split(",") if name.strip()
+        )
+
+        knowledge_file = Path(
+            os.getenv("KNOWLEDGE_FILE", "data/knowledge.json").strip() or "data/knowledge.json"
+        )
+        knowledge_gist_id = os.getenv("KNOWLEDGE_GIST_ID", "").strip() or None
+        knowledge_github_token = os.getenv("KNOWLEDGE_GITHUB_TOKEN", "").strip() or None
+
         return cls(
             discord_token=discord_token,
             gemini_api_key=gemini_api_key,
@@ -70,4 +88,9 @@ class BotConfig:
             system_instruction=system_instruction,
             guild_id=guild_id,
             port=port,
+            manager_role_name=manager_role_name,
+            manager_usernames=manager_usernames,
+            knowledge_file=knowledge_file,
+            knowledge_gist_id=knowledge_gist_id,
+            knowledge_github_token=knowledge_github_token,
         )

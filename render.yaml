@@ -19,3 +19,7 @@ services:
         value: minimal
       - key: BOT_SYSTEM_INSTRUCTION
         value: Bạn là một trợ lý AI thân thiện, hữu ích trong server Discord. Hãy trả lời rõ ràng, tự nhiên và súc tích bằng ngôn ngữ của người dùng.
+      - key: MANAGER_ROLE_NAME
+        value: Người quản lí
+      - key: KNOWLEDGE_MANAGER_USERNAMES
+        value: _ngkhoi.9999

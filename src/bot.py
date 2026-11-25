@@ -1,4 +1,4 @@
-"""Discord bot implementation with slash commands and multimodal Gemini AI chat."""
+"""Discord bot implementation with slash commands, multimodal AI, and role/DM knowledge updates."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from discord.ext import commands
 
 from src.ai_service import GeminiChatService, GeminiNotConfiguredError, ImageInput
 from src.config import BotConfig
+from src.knowledge import KnowledgeStore
 from src.utils import split_message
 
 
@@ -39,6 +40,10 @@ EXTENSION_TO_MIME = {
     ".webp": "image/webp",
     ".gif": "image/gif",
 }
+
+_DM_ADD_RE = re.compile(r"^(?:!teach|dạy:|nhớ:|cập nhật:)\s*(.*)$", re.IGNORECASE | re.DOTALL)
+_DM_LIST_RE = re.compile(r"^(?:!knowledge|xem kiến thức|kiến thức)$", re.IGNORECASE)
+_DM_REMOVE_RE = re.compile(r"^(?:!forget|quên:|xóa kiến thức)\s*(.*)$", re.IGNORECASE)
 
 
 def make_session_key(channel_id: int, user_id: int) -> str:
@@ -66,6 +71,38 @@ def resolve_image_mime_type(content_type: str | None, filename: str | None) -> s
         for ext, mime in EXTENSION_TO_MIME.items():
             if lower_name.endswith(ext):
                 return mime
+
+    return None
+
+
+def is_knowledge_manager(user: Any, config: BotConfig) -> bool:
+    """Return True if ``user`` is an authorized username or holds the manager role."""
+    username = (getattr(user, "name", "") or "").strip().lower()
+    allowed_usernames = {name.strip().lower() for name in config.manager_usernames if name.strip()}
+    if username and username in allowed_usernames:
+        return True
+
+    target_role = config.manager_role_name.strip().lower()
+    roles = getattr(user, "roles", None) or ()
+    return any((getattr(role, "name", "") or "").strip().lower() == target_role for role in roles)
+
+
+def parse_dm_knowledge_command(text: str) -> tuple[str, str] | None:
+    """Parse DM live-update knowledge commands; return None for regular AI chat."""
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+
+    if _DM_LIST_RE.match(cleaned):
+        return ("list", "")
+
+    add_match = _DM_ADD_RE.match(cleaned)
+    if add_match:
+        return ("add", add_match.group(1).strip())
+
+    remove_match = _DM_REMOVE_RE.match(cleaned)
+    if remove_match:
+        return ("remove", remove_match.group(1).strip())
 
     return None
 
@@ -102,12 +139,13 @@ def build_stream_preview(text: str, *, finished: bool = False) -> str:
 
 
 class DiscordGeminiBot(commands.Bot):
-    """Discord bot combining utility slash commands and multimodal Gemini AI chat."""
+    """Discord bot combining utility slash commands, multimodal AI, and managed knowledge."""
 
     def __init__(
         self,
         config: BotConfig,
         ai_service: GeminiChatService | None = None,
+        knowledge_store: KnowledgeStore | None = None,
     ) -> None:
         intents = discord.Intents.default()
         intents.message_content = True
@@ -115,12 +153,18 @@ class DiscordGeminiBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents, help_command=None)
         self.config = config
         self.started_at = datetime.now(timezone.utc)
+        self.knowledge_store = knowledge_store or KnowledgeStore(
+            file_path=config.knowledge_file,
+            gist_id=config.knowledge_gist_id,
+            github_token=config.knowledge_github_token,
+        )
         self.ai_service = ai_service or GeminiChatService(
             api_key=config.gemini_api_key,
             model=config.gemini_model,
             system_instruction=config.system_instruction,
             thinking_level=config.thinking_level,
             fallback_model=config.fallback_model,
+            knowledge_provider=self.knowledge_store.build_prompt_section,
         )
         self._commands_registered = False
 
@@ -137,10 +181,13 @@ class DiscordGeminiBot(commands.Bot):
             "ai_enabled": self.ai_service.is_configured,
             "model": self.config.gemini_model,
             "thinking_level": self.config.thinking_level or "default",
+            "knowledge_count": len(self.knowledge_store.list_entries()),
         }
 
     async def setup_hook(self) -> None:
-        """Register and sync application slash commands before connecting."""
+        """Load persisted knowledge and sync application slash commands."""
+        await self.knowledge_store.async_load()
+
         if not self._commands_registered:
             self._register_commands()
             self._commands_registered = True
@@ -167,6 +214,64 @@ class DiscordGeminiBot(commands.Bot):
             name="/ask & @mention",
         )
         await self.change_presence(status=discord.Status.online, activity=activity)
+
+    def _permission_denied_message(self) -> str:
+        managers = ", ".join(self.config.manager_usernames) or "_ngkhoi.9999"
+        return (
+            f"Bạn không có quyền cập nhật kiến thức cho bot. "
+            f"Cần có Role **`{self.config.manager_role_name}`** trong server "
+            f"hoặc là tài khoản **`{managers}`**."
+        )
+
+    async def _execute_knowledge_command(
+        self,
+        action: str,
+        arg: str,
+        *,
+        author: str,
+    ) -> str:
+        """Run add/list/remove knowledge actions shared by slash commands and DM updates."""
+        if action == "add":
+            if not arg.strip():
+                return "Hãy nhập nội dung kiến thức cần dạy cho bot (ví dụ: `dạy: Giờ mở cửa là 8h-22h`)."
+            entry = await self.knowledge_store.add(arg, author=author)
+            total = len(self.knowledge_store.list_entries())
+            return (
+                f"Đã tiếp thu kiến thức **#{entry.id}** (tổng cộng đang nhớ **{total}** mục):\n"
+                f"> {entry.content}"
+            )
+
+        if action == "list":
+            entries = self.knowledge_store.list_entries()
+            if not entries:
+                return "Hiện bot chưa được dạy kiến thức bổ sung nào."
+            lines = [f"**Kho kiến thức của bot ({len(entries)} mục):**"]
+            for entry in entries:
+                lines.append(f"- **#{entry.id}**: {entry.content} *(bởi `{entry.author}`)*")
+            return "\n".join(lines)
+
+        if action == "remove":
+            cleaned = arg.strip().lower()
+            if not cleaned:
+                return "Hãy nhập số ID cần xóa (vd: `1`) hoặc `all` để xóa toàn bộ."
+            if cleaned in ("all", "tất cả"):
+                cleared = await self.knowledge_store.clear()
+                return (
+                    f"Đã xóa toàn bộ **{cleared}** kiến thức đã lưu."
+                    if cleared
+                    else "Kho kiến thức hiện đang trống."
+                )
+            try:
+                entry_id = int(cleaned.lstrip("#"))
+            except ValueError:
+                return "ID không hợp lệ. Hãy nhập số thứ tự (vd: `1`) hoặc `all`."
+
+            removed = await self.knowledge_store.remove(entry_id)
+            if removed is None:
+                return f"Không tìm thấy kiến thức **#{entry_id}**."
+            return f"Đã xóa kiến thức **#{removed.id}**: {removed.content}"
+
+        return "Lệnh kiến thức không hợp lệ."
 
     async def _extract_images(
         self,
@@ -268,11 +373,30 @@ class DiscordGeminiBot(commands.Bot):
             await send_extra(extra_chunk)
 
     async def on_message(self, message: discord.Message) -> None:
-        """Reply with streaming Gemini AI when mentioned in a server or messaged in DM."""
+        """Handle DM live knowledge updates and multimodal Gemini AI chat."""
         if message.author.bot:
             return
 
         is_dm = isinstance(message.channel, discord.DMChannel)
+
+        if is_dm:
+            parsed_cmd = parse_dm_knowledge_command(message.content)
+            if parsed_cmd is not None:
+                if not is_knowledge_manager(message.author, self.config):
+                    await message.reply(self._permission_denied_message(), mention_author=False)
+                    return
+
+                action, arg = parsed_cmd
+                reply_text = await self._execute_knowledge_command(
+                    action, arg, author=str(message.author)
+                )
+                for index, chunk in enumerate(split_message(reply_text)):
+                    if index == 0:
+                        await message.reply(chunk, mention_author=False)
+                    else:
+                        await message.channel.send(chunk)
+                return
+
         is_mentioned = (
             self.user is not None
             and not message.mention_everyone
@@ -346,6 +470,11 @@ class DiscordGeminiBot(commands.Bot):
                 value=f"`{self.config.thinking_level or 'default'}`",
                 inline=True,
             )
+            embed.add_field(
+                name="Kiến thức đã học",
+                value=f"{len(self.knowledge_store.list_entries())} mục",
+                inline=True,
+            )
             await interaction.response.send_message(embed=embed)
 
         @self.tree.command(name="ask", description="Hỏi Gemini AI (có thể đính kèm ảnh)")
@@ -411,6 +540,62 @@ class DiscordGeminiBot(commands.Bot):
                     ephemeral=private,
                 )
 
+        @self.tree.command(
+            name="teach",
+            description="Dạy kiến thức mới cho bot (chỉ Role Người quản lí hoặc _ngkhoi.9999)",
+        )
+        @app_commands.describe(content="Thông tin, quy định hoặc kiến thức bạn muốn bot ghi nhớ")
+        async def teach_command(interaction: discord.Interaction, content: str) -> None:
+            if not is_knowledge_manager(interaction.user, self.config):
+                await interaction.response.send_message(
+                    self._permission_denied_message(), ephemeral=True
+                )
+                return
+
+            await interaction.response.defer(ephemeral=True)
+            result = await self._execute_knowledge_command(
+                "add", content, author=str(interaction.user)
+            )
+            for chunk in split_message(result):
+                await interaction.followup.send(chunk, ephemeral=True)
+
+        @self.tree.command(
+            name="knowledge",
+            description="Xem toàn bộ kiến thức bot đã học (chỉ Role Người quản lí hoặc _ngkhoi.9999)",
+        )
+        async def knowledge_command(interaction: discord.Interaction) -> None:
+            if not is_knowledge_manager(interaction.user, self.config):
+                await interaction.response.send_message(
+                    self._permission_denied_message(), ephemeral=True
+                )
+                return
+
+            result = await self._execute_knowledge_command(
+                "list", "", author=str(interaction.user)
+            )
+            chunks = split_message(result)
+            await interaction.response.send_message(chunks[0], ephemeral=True)
+            for extra in chunks[1:]:
+                await interaction.followup.send(extra, ephemeral=True)
+
+        @self.tree.command(
+            name="forget",
+            description="Xóa kiến thức đã dạy cho bot (chỉ Role Người quản lí hoặc _ngkhoi.9999)",
+        )
+        @app_commands.describe(target="Số ID kiến thức cần xóa (vd: 1) hoặc 'all' để xóa hết")
+        async def forget_command(interaction: discord.Interaction, target: str) -> None:
+            if not is_knowledge_manager(interaction.user, self.config):
+                await interaction.response.send_message(
+                    self._permission_denied_message(), ephemeral=True
+                )
+                return
+
+            await interaction.response.defer(ephemeral=True)
+            result = await self._execute_knowledge_command(
+                "remove", target, author=str(interaction.user)
+            )
+            await interaction.followup.send(result, ephemeral=True)
+
         @self.tree.command(name="reset", description="Xóa ngữ cảnh hội thoại AI của bạn ở kênh này")
         async def reset_command(interaction: discord.Interaction) -> None:
             session_key = make_session_key(interaction.channel_id or 0, interaction.user.id)
@@ -430,7 +615,7 @@ class DiscordGeminiBot(commands.Bot):
         async def help_command(interaction: discord.Interaction) -> None:
             embed = discord.Embed(
                 title="Hướng dẫn sử dụng Bot",
-                description="Bot hỗ trợ **Slash Commands**, **xem ảnh** và **chat trực tiếp với Gemini AI** (streaming).",
+                description="Bot hỗ trợ **Slash Commands**, **xem ảnh**, **cập nhật kiến thức** và **chat trực tiếp với Gemini AI**.",
                 color=discord.Color.green(),
             )
             embed.add_field(
@@ -448,6 +633,16 @@ class DiscordGeminiBot(commands.Bot):
                     "`/ask <câu hỏi> [image]` — Hỏi Gemini AI (có thể đính kèm ảnh & bật `private`)\n"
                     "`/reset` — Xóa ngữ cảnh hội thoại hiện tại\n"
                     "`@mention` (kèm ảnh hoặc Reply vào tin nhắn có ảnh) / **DM** — Chat liên tục nhiều lượt"
+                ),
+                inline=False,
+            )
+            embed.add_field(
+                name=f"Dạy kiến thức (Role `{self.config.manager_role_name}` hoặc `_ngkhoi.9999`)",
+                value=(
+                    "`/teach <nội dung>` — Dạy kiến thức mới cho bot\n"
+                    "`/knowledge` — Xem các kiến thức bot đang nhớ\n"
+                    "`/forget <id | all>` — Xóa kiến thức theo ID hoặc xóa hết\n"
+                    "**Chat DM trực tuyến (`_ngkhoi.9999`)**: `dạy: <nội dung>`, `nhớ: <nội dung>`, `xem kiến thức`, `quên: <id | all>`"
                 ),
                 inline=False,
             )

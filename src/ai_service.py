@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import logging
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -46,6 +46,7 @@ class GeminiChatService:
         thinking_level: str | None = "minimal",
         fallback_model: str | None = "gemini-3.5-flash-lite",
         request_timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        knowledge_provider: Callable[[], str] | None = None,
         client: Any | None = None,
     ) -> None:
         self.model = model
@@ -53,6 +54,7 @@ class GeminiChatService:
         self.thinking_level = thinking_level
         self.fallback_model = fallback_model
         self.request_timeout = request_timeout
+        self.knowledge_provider = knowledge_provider
         self._sessions: dict[str, str] = {}
 
         if client is not None:
@@ -66,6 +68,15 @@ class GeminiChatService:
     def is_configured(self) -> bool:
         """Return True if a Gemini client is available."""
         return self._client is not None
+
+    def _effective_system_instruction(self) -> str:
+        """Combine base system instruction with any dynamic learned knowledge."""
+        parts = [part.strip() for part in (self.system_instruction,) if part and part.strip()]
+        if self.knowledge_provider is not None:
+            extra = self.knowledge_provider().strip()
+            if extra:
+                parts.append(extra)
+        return "\n\n".join(parts)
 
     def _build_input_payload(
         self,
@@ -104,8 +115,9 @@ class GeminiChatService:
             "input": self._build_input_payload(cleaned_prompt, images=images),
             "timeout": self.request_timeout,
         }
-        if self.system_instruction:
-            kwargs["system_instruction"] = self.system_instruction
+        full_instruction = self._effective_system_instruction()
+        if full_instruction:
+            kwargs["system_instruction"] = full_instruction
         if thinking_level:
             kwargs["generation_config"] = {"thinking_level": thinking_level}
 
