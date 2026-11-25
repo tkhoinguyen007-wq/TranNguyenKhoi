@@ -85,6 +85,7 @@ class DiscordGeminiBot(commands.Bot):
             model=config.gemini_model,
             system_instruction=config.system_instruction,
             thinking_level=config.thinking_level,
+            fallback_model=config.fallback_model,
         )
         self._commands_registered = False
 

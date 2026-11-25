@@ -168,8 +168,9 @@ async def test_bot_stream_reply_edits_initial_and_sends_final_chunks() -> None:
     config = BotConfig(
         discord_token="dummy",
         gemini_api_key=None,
-        gemini_model="gemini-4-hydrogen",
-        thinking_level="low",
+        gemini_model="gemini-3.5-flash-lite",
+        fallback_model="gemini-3.5-flash-lite",
+        thinking_level="minimal",
         system_instruction="Be helpful.",
         guild_id=None,
         port=8080,
@@ -206,6 +207,40 @@ async def test_bot_stream_reply_edits_initial_and_sends_final_chunks() -> None:
 
     assert events[0][0] == "initial"
     assert events[-1] == ("edit", "Stream #1: Test")
+
+
+@pytest.mark.asyncio
+async def test_gemini_chat_service_falls_back_on_primary_error() -> None:
+    class FailingPrimaryInteractions:
+        def __init__(self) -> None:
+            self.models_tried: list[str] = []
+
+        async def create(self, **kwargs):
+            self.models_tried.append(kwargs["model"])
+            if kwargs["model"] == "gemini-4-hydrogen":
+                raise TimeoutError("simulated timeout")
+
+            async def ok_stream():
+                yield SimpleNamespace(
+                    event_type="step.delta",
+                    delta=SimpleNamespace(type="text", text="Fallback OK"),
+                )
+
+            return ok_stream()
+
+    failing_interactions = FailingPrimaryInteractions()
+    client = SimpleNamespace(aio=SimpleNamespace(interactions=failing_interactions))
+    service = GeminiChatService(
+        api_key=None,
+        model="gemini-4-hydrogen",
+        fallback_model="gemini-3.5-flash-lite",
+        thinking_level="low",
+        client=client,
+    )
+
+    chunks = [chunk async for chunk in service.stream_ask("fb:1", "hello")]
+    assert "".join(chunks) == "Fallback OK"
+    assert failing_interactions.models_tried == ["gemini-4-hydrogen", "gemini-3.5-flash-lite"]
 
 
 @pytest.mark.asyncio

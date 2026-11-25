@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
 from google import genai
+
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 25.0
 
 
 class GeminiNotConfiguredError(RuntimeError):
@@ -18,14 +24,18 @@ class GeminiChatService:
     def __init__(
         self,
         api_key: str | None,
-        model: str = "gemini-4-hydrogen",
+        model: str = "gemini-3.5-flash-lite",
         system_instruction: str = "",
-        thinking_level: str | None = "low",
+        thinking_level: str | None = "minimal",
+        fallback_model: str | None = "gemini-3.5-flash-lite",
+        request_timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
         client: Any | None = None,
     ) -> None:
         self.model = model
         self.system_instruction = system_instruction
         self.thinking_level = thinking_level
+        self.fallback_model = fallback_model
+        self.request_timeout = request_timeout
         self._sessions: dict[str, str] = {}
 
         if client is not None:
@@ -45,17 +55,20 @@ class GeminiChatService:
         session_key: str,
         cleaned_prompt: str,
         *,
+        model: str,
+        thinking_level: str | None,
         stream: bool = False,
     ) -> dict[str, Any]:
         """Build keyword arguments for `aio.interactions.create`."""
         kwargs: dict[str, Any] = {
-            "model": self.model,
+            "model": model,
             "input": cleaned_prompt,
+            "timeout": self.request_timeout,
         }
         if self.system_instruction:
             kwargs["system_instruction"] = self.system_instruction
-        if self.thinking_level:
-            kwargs["generation_config"] = {"thinking_level": self.thinking_level}
+        if thinking_level:
+            kwargs["generation_config"] = {"thinking_level": thinking_level}
 
         previous_id = self._sessions.get(session_key)
         if previous_id:
@@ -73,6 +86,14 @@ class GeminiChatService:
             )
         return self._client
 
+    def _model_candidates(self) -> list[tuple[str, str | None]]:
+        """Return primary and optional fallback `(model, thinking_level)` pairs."""
+        candidates: list[tuple[str, str | None]] = [(self.model, self.thinking_level)]
+        if self.fallback_model and self.fallback_model != self.model:
+            fallback_thinking = "minimal" if "flash-lite" in self.fallback_model else "low"
+            candidates.append((self.fallback_model, fallback_thinking))
+        return candidates
+
     async def ask(self, session_key: str, prompt: str) -> str:
         """Send a prompt to Gemini and remember the interaction ID for follow-up turns."""
         client = self._ensure_configured()
@@ -81,18 +102,36 @@ class GeminiChatService:
         if not cleaned_prompt:
             return "Bạn hãy nhập nội dung câu hỏi để mình trả lời nhé."
 
-        kwargs = self._build_request_kwargs(session_key, cleaned_prompt, stream=False)
-        interaction = await client.aio.interactions.create(**kwargs)
+        candidates = self._model_candidates()
+        for idx, (model_name, thinking) in enumerate(candidates):
+            kwargs = self._build_request_kwargs(
+                session_key,
+                cleaned_prompt,
+                model=model_name,
+                thinking_level=thinking,
+                stream=False,
+            )
+            try:
+                interaction = await client.aio.interactions.create(**kwargs)
+                interaction_id = getattr(interaction, "id", None)
+                if interaction_id:
+                    self._sessions[session_key] = interaction_id
+                output_text = (getattr(interaction, "output_text", None) or "").strip()
+                return output_text or "(Mình không nhận được nội dung phản hồi từ mô hình.)"
+            except Exception as exc:
+                if idx + 1 >= len(candidates):
+                    raise
+                logger.warning(
+                    "Primary model %s failed (%s); falling back to %s",
+                    model_name,
+                    exc,
+                    candidates[idx + 1][0],
+                )
 
-        interaction_id = getattr(interaction, "id", None)
-        if interaction_id:
-            self._sessions[session_key] = interaction_id
-
-        output_text = (getattr(interaction, "output_text", None) or "").strip()
-        return output_text or "(Mình không nhận được nội dung phản hồi từ mô hình.)"
+        raise RuntimeError("No Gemini model candidates available.")
 
     async def stream_ask(self, session_key: str, prompt: str) -> AsyncIterator[str]:
-        """Stream text deltas from Gemini while keeping conversation state."""
+        """Stream text deltas from Gemini with fallback if primary model stalls/fails."""
         client = self._ensure_configured()
 
         cleaned_prompt = prompt.strip()
@@ -100,26 +139,46 @@ class GeminiChatService:
             yield "Bạn hãy nhập nội dung câu hỏi để mình trả lời nhé."
             return
 
-        kwargs = self._build_request_kwargs(session_key, cleaned_prompt, stream=True)
-        stream = await client.aio.interactions.create(**kwargs)
+        candidates = self._model_candidates()
+        for idx, (model_name, thinking) in enumerate(candidates):
+            emitted_any = False
+            kwargs = self._build_request_kwargs(
+                session_key,
+                cleaned_prompt,
+                model=model_name,
+                thinking_level=thinking,
+                stream=True,
+            )
+            try:
+                stream = await client.aio.interactions.create(**kwargs)
+                async for event in stream:
+                    event_type = getattr(event, "event_type", None)
 
-        async for event in stream:
-            event_type = getattr(event, "event_type", None)
-
-            if event_type in ("interaction.created", "interaction.completed"):
-                interaction = getattr(event, "interaction", None)
-                interaction_id = getattr(interaction, "id", None)
-                if interaction_id:
-                    self._sessions[session_key] = interaction_id
-            elif event_type == "step.delta":
-                delta = getattr(event, "delta", None)
-                if getattr(delta, "type", None) == "text":
-                    text_chunk = getattr(delta, "text", "")
-                    if text_chunk:
-                        yield text_chunk
-            elif event_type == "error":
-                error_obj = getattr(event, "error", None)
-                raise RuntimeError(f"Gemini streaming error: {error_obj}")
+                    if event_type in ("interaction.created", "interaction.completed"):
+                        interaction = getattr(event, "interaction", None)
+                        interaction_id = getattr(interaction, "id", None)
+                        if interaction_id:
+                            self._sessions[session_key] = interaction_id
+                    elif event_type == "step.delta":
+                        delta = getattr(event, "delta", None)
+                        if getattr(delta, "type", None) == "text":
+                            text_chunk = getattr(delta, "text", "")
+                            if text_chunk:
+                                emitted_any = True
+                                yield text_chunk
+                    elif event_type == "error":
+                        error_obj = getattr(event, "error", None)
+                        raise RuntimeError(f"Gemini streaming error: {error_obj}")
+                return
+            except Exception as exc:
+                if emitted_any or idx + 1 >= len(candidates):
+                    raise
+                logger.warning(
+                    "Primary streaming model %s failed (%s); falling back to %s",
+                    model_name,
+                    exc,
+                    candidates[idx + 1][0],
+                )
 
     def reset_session(self, session_key: str) -> bool:
         """Clear saved conversation state for the given session key."""
