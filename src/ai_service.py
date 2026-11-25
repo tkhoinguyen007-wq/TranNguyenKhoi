@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from google import genai
@@ -12,6 +14,21 @@ from google import genai
 logger = logging.getLogger(__name__)
 
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 25.0
+DEFAULT_IMAGE_PROMPT = "Hãy xem và mô tả chi tiết hình ảnh này."
+
+
+@dataclass(frozen=True)
+class ImageInput:
+    """Base64-encoded image payload for Gemini multimodal interactions."""
+
+    data_base64: str
+    mime_type: str
+
+    @classmethod
+    def from_bytes(cls, raw_bytes: bytes, mime_type: str) -> "ImageInput":
+        """Encode raw image bytes to ASCII base64."""
+        encoded = base64.b64encode(raw_bytes).decode("ascii")
+        return cls(data_base64=encoded, mime_type=mime_type)
 
 
 class GeminiNotConfiguredError(RuntimeError):
@@ -50,6 +67,27 @@ class GeminiChatService:
         """Return True if a Gemini client is available."""
         return self._client is not None
 
+    def _build_input_payload(
+        self,
+        cleaned_prompt: str,
+        images: Sequence[ImageInput] | None = None,
+    ) -> str | list[dict[str, str]]:
+        """Build either plain text or multimodal list input for Gemini."""
+        if not images:
+            return cleaned_prompt
+
+        prompt_text = cleaned_prompt or DEFAULT_IMAGE_PROMPT
+        blocks: list[dict[str, str]] = [{"type": "text", "text": prompt_text}]
+        for image in images:
+            blocks.append(
+                {
+                    "type": "image",
+                    "data": image.data_base64,
+                    "mime_type": image.mime_type,
+                }
+            )
+        return blocks
+
     def _build_request_kwargs(
         self,
         session_key: str,
@@ -57,12 +95,13 @@ class GeminiChatService:
         *,
         model: str,
         thinking_level: str | None,
+        images: Sequence[ImageInput] | None = None,
         stream: bool = False,
     ) -> dict[str, Any]:
         """Build keyword arguments for `aio.interactions.create`."""
         kwargs: dict[str, Any] = {
             "model": model,
-            "input": cleaned_prompt,
+            "input": self._build_input_payload(cleaned_prompt, images=images),
             "timeout": self.request_timeout,
         }
         if self.system_instruction:
@@ -94,12 +133,17 @@ class GeminiChatService:
             candidates.append((self.fallback_model, fallback_thinking))
         return candidates
 
-    async def ask(self, session_key: str, prompt: str) -> str:
-        """Send a prompt to Gemini and remember the interaction ID for follow-up turns."""
+    async def ask(
+        self,
+        session_key: str,
+        prompt: str,
+        images: Sequence[ImageInput] | None = None,
+    ) -> str:
+        """Send a prompt (optionally with images) to Gemini and save conversation state."""
         client = self._ensure_configured()
 
         cleaned_prompt = prompt.strip()
-        if not cleaned_prompt:
+        if not cleaned_prompt and not images:
             return "Bạn hãy nhập nội dung câu hỏi để mình trả lời nhé."
 
         candidates = self._model_candidates()
@@ -109,6 +153,7 @@ class GeminiChatService:
                 cleaned_prompt,
                 model=model_name,
                 thinking_level=thinking,
+                images=images,
                 stream=False,
             )
             try:
@@ -130,12 +175,17 @@ class GeminiChatService:
 
         raise RuntimeError("No Gemini model candidates available.")
 
-    async def stream_ask(self, session_key: str, prompt: str) -> AsyncIterator[str]:
-        """Stream text deltas from Gemini with fallback if primary model stalls/fails."""
+    async def stream_ask(
+        self,
+        session_key: str,
+        prompt: str,
+        images: Sequence[ImageInput] | None = None,
+    ) -> AsyncIterator[str]:
+        """Stream text deltas from Gemini (optionally with images) with fallback."""
         client = self._ensure_configured()
 
         cleaned_prompt = prompt.strip()
-        if not cleaned_prompt:
+        if not cleaned_prompt and not images:
             yield "Bạn hãy nhập nội dung câu hỏi để mình trả lời nhé."
             return
 
@@ -147,6 +197,7 @@ class GeminiChatService:
                 cleaned_prompt,
                 model=model_name,
                 thinking_level=thinking,
+                images=images,
                 stream=True,
             )
             try:

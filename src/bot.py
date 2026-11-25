@@ -1,11 +1,11 @@
-"""Discord bot implementation with slash commands and streaming Gemini AI chat."""
+"""Discord bot implementation with slash commands and multimodal Gemini AI chat."""
 
 from __future__ import annotations
 
 import logging
 import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
@@ -13,7 +13,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from src.ai_service import GeminiChatService, GeminiNotConfiguredError
+from src.ai_service import GeminiChatService, GeminiNotConfiguredError, ImageInput
 from src.config import BotConfig
 from src.utils import split_message
 
@@ -22,6 +22,23 @@ logger = logging.getLogger(__name__)
 
 STREAM_EDIT_INTERVAL_SECONDS = 0.8
 STREAM_TYPING_INDICATOR = " ..."
+MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB per image
+MAX_IMAGES_PER_MESSAGE = 4
+
+SUPPORTED_IMAGE_MIME_TYPES = {
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+}
+
+EXTENSION_TO_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
 
 
 def make_session_key(channel_id: int, user_id: int) -> str:
@@ -33,6 +50,24 @@ def strip_bot_mention(content: str, bot_user_id: int) -> str:
     """Remove direct bot mention tags from a Discord message."""
     pattern = rf"<@!?{bot_user_id}>"
     return re.sub(pattern, "", content).strip()
+
+
+def resolve_image_mime_type(content_type: str | None, filename: str | None) -> str | None:
+    """Normalize and validate an attachment's image MIME type."""
+    if content_type:
+        base_type = content_type.split(";", 1)[0].strip().lower()
+        if base_type == "image/jpg":
+            base_type = "image/jpeg"
+        if base_type in SUPPORTED_IMAGE_MIME_TYPES:
+            return base_type
+
+    if filename:
+        lower_name = filename.lower()
+        for ext, mime in EXTENSION_TO_MIME.items():
+            if lower_name.endswith(ext):
+                return mime
+
+    return None
 
 
 def format_uptime(started_at: datetime, now: datetime | None = None) -> str:
@@ -67,7 +102,7 @@ def build_stream_preview(text: str, *, finished: bool = False) -> str:
 
 
 class DiscordGeminiBot(commands.Bot):
-    """Discord bot combining utility slash commands and streaming Gemini AI chat."""
+    """Discord bot combining utility slash commands and multimodal Gemini AI chat."""
 
     def __init__(
         self,
@@ -133,6 +168,58 @@ class DiscordGeminiBot(commands.Bot):
         )
         await self.change_presence(status=discord.Status.online, activity=activity)
 
+    async def _extract_images(
+        self,
+        attachments: Sequence[discord.Attachment],
+        *,
+        limit: int = MAX_IMAGES_PER_MESSAGE,
+    ) -> list[ImageInput]:
+        """Download supported image attachments up to ``limit`` and ``MAX_IMAGE_BYTES``."""
+        images: list[ImageInput] = []
+        for attachment in attachments:
+            if len(images) >= limit:
+                break
+            mime_type = resolve_image_mime_type(attachment.content_type, attachment.filename)
+            if not mime_type:
+                continue
+            if attachment.size > MAX_IMAGE_BYTES:
+                logger.info(
+                    "Skipping oversized image attachment %s (%d bytes)",
+                    attachment.filename,
+                    attachment.size,
+                )
+                continue
+            try:
+                raw_bytes = await attachment.read()
+            except Exception:
+                logger.warning("Failed to download attachment %s", attachment.filename, exc_info=True)
+                continue
+            if len(raw_bytes) > MAX_IMAGE_BYTES:
+                continue
+            images.append(ImageInput.from_bytes(raw_bytes, mime_type))
+        return images
+
+    async def _collect_message_images(self, message: discord.Message) -> list[ImageInput]:
+        """Collect images from the message itself and, if replying, the referenced message."""
+        images = await self._extract_images(message.attachments, limit=MAX_IMAGES_PER_MESSAGE)
+        remaining = MAX_IMAGES_PER_MESSAGE - len(images)
+        if remaining <= 0 or not message.reference or not message.reference.message_id:
+            return images
+
+        ref_message: discord.Message | None = None
+        if isinstance(message.reference.resolved, discord.Message):
+            ref_message = message.reference.resolved
+        else:
+            try:
+                ref_message = await message.channel.fetch_message(message.reference.message_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                ref_message = None
+
+        if ref_message and ref_message.attachments:
+            images.extend(await self._extract_images(ref_message.attachments, limit=remaining))
+
+        return images
+
     async def _stream_reply(
         self,
         session_key: str,
@@ -140,6 +227,7 @@ class DiscordGeminiBot(commands.Bot):
         send_initial: Callable[[str], Awaitable[Any]],
         edit_message: Callable[[Any, str], Awaitable[Any]],
         send_extra: Callable[[str], Awaitable[Any]],
+        images: Sequence[ImageInput] | None = None,
     ) -> None:
         """Stream Gemini text deltas and progressively update the Discord response."""
         buffer: list[str] = []
@@ -147,7 +235,7 @@ class DiscordGeminiBot(commands.Bot):
         last_rendered = ""
         last_edit_at = 0.0
 
-        async for delta in self.ai_service.stream_ask(session_key, prompt):
+        async for delta in self.ai_service.stream_ask(session_key, prompt, images=images):
             buffer.append(delta)
             accumulated = "".join(buffer)
             if not accumulated.strip():
@@ -199,9 +287,11 @@ class DiscordGeminiBot(commands.Bot):
         if self.user is not None:
             prompt = strip_bot_mention(prompt, self.user.id)
 
-        if not prompt:
+        images = await self._collect_message_images(message)
+
+        if not prompt and not images:
             await message.reply(
-                "Chào bạn! Hãy nhắn câu hỏi kèm `@mention` hoặc dùng lệnh `/ask` để trò chuyện với mình nhé.",
+                "Chào bạn! Hãy nhắn câu hỏi (kèm ảnh nếu muốn) với `@mention` hoặc dùng lệnh `/ask` để trò chuyện với mình nhé.",
                 mention_author=False,
             )
             return
@@ -212,6 +302,7 @@ class DiscordGeminiBot(commands.Bot):
                 await self._stream_reply(
                     session_key=session_key,
                     prompt=prompt,
+                    images=images,
                     send_initial=lambda text: message.reply(text, mention_author=False),
                     edit_message=lambda msg, text: msg.edit(content=text),
                     send_extra=lambda text: message.channel.send(text),
@@ -257,14 +348,16 @@ class DiscordGeminiBot(commands.Bot):
             )
             await interaction.response.send_message(embed=embed)
 
-        @self.tree.command(name="ask", description="Hỏi Gemini AI bất kỳ điều gì")
+        @self.tree.command(name="ask", description="Hỏi Gemini AI (có thể đính kèm ảnh)")
         @app_commands.describe(
             prompt="Câu hỏi hoặc yêu cầu bạn muốn gửi cho AI",
+            image="Ảnh đính kèm để bot xem và phân tích (PNG/JPG/WEBP/GIF, tối đa 10 MB)",
             private="Chỉ mình bạn nhìn thấy câu trả lời",
         )
         async def ask_command(
             interaction: discord.Interaction,
             prompt: str,
+            image: discord.Attachment | None = None,
             private: bool = False,
         ) -> None:
             try:
@@ -273,12 +366,36 @@ class DiscordGeminiBot(commands.Bot):
                 logger.warning("Interaction %s expired before defer()", interaction.id)
                 return
 
+            images: list[ImageInput] = []
+            if image is not None:
+                mime_type = resolve_image_mime_type(image.content_type, image.filename)
+                if not mime_type:
+                    await interaction.followup.send(
+                        "File đính kèm chưa phải ảnh hợp lệ. Hãy gửi file PNG, JPG, WEBP hoặc GIF nhé.",
+                        ephemeral=private,
+                    )
+                    return
+                if image.size > MAX_IMAGE_BYTES:
+                    await interaction.followup.send(
+                        "Ảnh vượt quá giới hạn 10 MB. Vui lòng chọn ảnh nhỏ hơn nhé.",
+                        ephemeral=private,
+                    )
+                    return
+                images = await self._extract_images([image], limit=1)
+                if not images:
+                    await interaction.followup.send(
+                        "Mình không tải được ảnh đính kèm, bạn thử gửi lại nhé.",
+                        ephemeral=private,
+                    )
+                    return
+
             session_key = make_session_key(interaction.channel_id or 0, interaction.user.id)
 
             try:
                 await self._stream_reply(
                     session_key=session_key,
                     prompt=prompt,
+                    images=images,
                     send_initial=lambda text: interaction.followup.send(
                         text, ephemeral=private, wait=True
                     ),
@@ -313,7 +430,7 @@ class DiscordGeminiBot(commands.Bot):
         async def help_command(interaction: discord.Interaction) -> None:
             embed = discord.Embed(
                 title="Hướng dẫn sử dụng Bot",
-                description="Bot hỗ trợ cả **Slash Commands** và **chat trực tiếp với Gemini AI** (phản hồi streaming).",
+                description="Bot hỗ trợ **Slash Commands**, **xem ảnh** và **chat trực tiếp với Gemini AI** (streaming).",
                 color=discord.Color.green(),
             )
             embed.add_field(
@@ -326,11 +443,11 @@ class DiscordGeminiBot(commands.Bot):
                 inline=False,
             )
             embed.add_field(
-                name="Trò chuyện với AI",
+                name="Trò chuyện & Xem ảnh với AI",
                 value=(
-                    "`/ask <câu hỏi>` — Hỏi Gemini AI (có tùy chọn `private`)\n"
+                    "`/ask <câu hỏi> [image]` — Hỏi Gemini AI (có thể đính kèm ảnh & bật `private`)\n"
                     "`/reset` — Xóa ngữ cảnh hội thoại hiện tại\n"
-                    "`@mention` hoặc **DM** — Tag tên bot hoặc nhắn riêng để chat liên tục nhiều lượt"
+                    "`@mention` (kèm ảnh hoặc Reply vào tin nhắn có ảnh) / **DM** — Chat liên tục nhiều lượt"
                 ),
                 inline=False,
             )

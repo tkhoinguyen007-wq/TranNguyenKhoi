@@ -1,19 +1,22 @@
-"""Unit tests for message splitting, GeminiChatService, bot streaming, and health server."""
+"""Unit tests for message splitting, GeminiChatService, multimodal images, and health server."""
 
 from __future__ import annotations
 
+import base64
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from src.ai_service import GeminiChatService, GeminiNotConfiguredError
+from src.ai_service import DEFAULT_IMAGE_PROMPT, GeminiChatService, GeminiNotConfiguredError, ImageInput
 from src.bot import (
     DiscordGeminiBot,
+    MAX_IMAGE_BYTES,
     build_stream_preview,
     format_uptime,
     make_session_key,
+    resolve_image_mime_type,
     strip_bot_mention,
 )
 from src.config import BotConfig
@@ -32,10 +35,12 @@ class FakeAsyncInteractions:
         self._counter += 1
         self.calls.append(kwargs)
         interaction_id = f"inter_{self._counter}"
+        raw_input = kwargs["input"]
+        prompt_summary = (
+            raw_input[0]["text"] if isinstance(raw_input, list) else raw_input
+        )
 
         if kwargs.get("stream"):
-            prompt = kwargs["input"]
-
             async def event_stream():
                 yield SimpleNamespace(
                     event_type="interaction.created",
@@ -51,7 +56,7 @@ class FakeAsyncInteractions:
                 )
                 yield SimpleNamespace(
                     event_type="step.delta",
-                    delta=SimpleNamespace(type="text", text=prompt),
+                    delta=SimpleNamespace(type="text", text=prompt_summary),
                 )
                 yield SimpleNamespace(
                     event_type="interaction.completed",
@@ -62,7 +67,7 @@ class FakeAsyncInteractions:
 
         return SimpleNamespace(
             id=interaction_id,
-            output_text=f"Reply #{self._counter}: {kwargs['input']}",
+            output_text=f"Reply #{self._counter}: {prompt_summary}",
         )
 
 
@@ -71,6 +76,26 @@ class FakeGenAIClient:
 
     def __init__(self) -> None:
         self.aio = SimpleNamespace(interactions=FakeAsyncInteractions())
+
+
+class FakeAttachment:
+    """Minimal stub for `discord.Attachment`."""
+
+    def __init__(
+        self,
+        *,
+        filename: str,
+        content_type: str | None,
+        payload: bytes,
+        size: int | None = None,
+    ) -> None:
+        self.filename = filename
+        self.content_type = content_type
+        self._payload = payload
+        self.size = len(payload) if size is None else size
+
+    async def read(self) -> bytes:
+        return self._payload
 
 
 def test_split_message_short_and_empty() -> None:
@@ -90,6 +115,13 @@ def test_strip_bot_mention_handles_nick_and_standard_tags() -> None:
     assert strip_bot_mention("<@123456> hỏi cái này", 123456) == "hỏi cái này"
     assert strip_bot_mention("<@!123456>   hello", 123456) == "hello"
     assert strip_bot_mention("<@123456>", 123456) == ""
+
+
+def test_resolve_image_mime_type() -> None:
+    assert resolve_image_mime_type("image/png; charset=utf-8", "a.bin") == "image/png"
+    assert resolve_image_mime_type("image/jpg", "photo.jpg") == "image/jpeg"
+    assert resolve_image_mime_type(None, "screenshot.WEBP") == "image/webp"
+    assert resolve_image_mime_type("application/pdf", "doc.pdf") is None
 
 
 def test_format_uptime() -> None:
@@ -113,9 +145,9 @@ async def test_gemini_chat_service_stateful_and_reset() -> None:
     fake_client = FakeGenAIClient()
     service = GeminiChatService(
         api_key=None,
-        model="gemini-4-hydrogen",
+        model="gemini-3.5-flash-lite",
         system_instruction="Be helpful.",
-        thinking_level="low",
+        thinking_level="minimal",
         client=fake_client,
     )
     key = make_session_key(10, 20)
@@ -126,7 +158,7 @@ async def test_gemini_chat_service_stateful_and_reset() -> None:
     assert first == "Reply #1: Chào bạn"
     assert second == "Reply #2: Tên tôi là An"
     assert fake_client.aio.interactions.calls[0]["system_instruction"] == "Be helpful."
-    assert fake_client.aio.interactions.calls[0]["generation_config"] == {"thinking_level": "low"}
+    assert fake_client.aio.interactions.calls[0]["generation_config"] == {"thinking_level": "minimal"}
     assert "previous_interaction_id" not in fake_client.aio.interactions.calls[0]
     assert fake_client.aio.interactions.calls[1]["system_instruction"] == "Be helpful."
     assert fake_client.aio.interactions.calls[1]["previous_interaction_id"] == "inter_1"
@@ -141,25 +173,72 @@ async def test_gemini_chat_service_stateful_and_reset() -> None:
 
 
 @pytest.mark.asyncio
-async def test_gemini_chat_service_streaming_tracks_session_and_ignores_thoughts() -> None:
+async def test_gemini_chat_service_multimodal_images_and_default_prompt() -> None:
     fake_client = FakeGenAIClient()
     service = GeminiChatService(
         api_key=None,
-        model="gemini-4-hydrogen",
-        system_instruction="Be fast.",
-        thinking_level="low",
+        model="gemini-3.5-flash-lite",
+        thinking_level="minimal",
         client=fake_client,
     )
-    key = make_session_key(99, 77)
+    img = ImageInput.from_bytes(b"png-bytes", "image/png")
 
-    chunks = [chunk async for chunk in service.stream_ask(key, "Xin chào")]
-    assert "".join(chunks) == "Stream #1: Xin chào"
-    assert fake_client.aio.interactions.calls[0]["stream"] is True
-    assert fake_client.aio.interactions.calls[0]["generation_config"] == {"thinking_level": "low"}
+    chunks = [chunk async for chunk in service.stream_ask("img:1", "", images=[img])]
+    assert "".join(chunks) == f"Stream #1: {DEFAULT_IMAGE_PROMPT}"
 
-    follow_up = [chunk async for chunk in service.stream_ask(key, "Tiếp tục")]
-    assert "".join(follow_up) == "Stream #2: Tiếp tục"
-    assert fake_client.aio.interactions.calls[1]["previous_interaction_id"] == "inter_1"
+    sent_input = fake_client.aio.interactions.calls[0]["input"]
+    assert isinstance(sent_input, list)
+    assert sent_input[0] == {"type": "text", "text": DEFAULT_IMAGE_PROMPT}
+    assert sent_input[1] == {
+        "type": "image",
+        "data": base64.b64encode(b"png-bytes").decode("ascii"),
+        "mime_type": "image/png",
+    }
+
+
+@pytest.mark.asyncio
+async def test_bot_collect_message_images_reads_message_and_reply() -> None:
+    config = BotConfig(
+        discord_token="dummy",
+        gemini_api_key=None,
+        gemini_model="gemini-3.5-flash-lite",
+        fallback_model="gemini-3.5-flash-lite",
+        thinking_level="minimal",
+        system_instruction="Be helpful.",
+        guild_id=None,
+        port=8080,
+    )
+    bot = DiscordGeminiBot(config=config, ai_service=GeminiChatService(api_key=None))
+
+    replied_msg = SimpleNamespace(
+        attachments=[
+            FakeAttachment(filename="ref.jpg", content_type="image/jpeg", payload=b"ref-img"),
+            FakeAttachment(filename="notes.txt", content_type="text/plain", payload=b"ignore"),
+        ]
+    )
+    async def fetch_message(_msg_id: int):
+        return replied_msg
+
+    msg = SimpleNamespace(
+        attachments=[
+            FakeAttachment(filename="own.png", content_type="image/png", payload=b"own-img"),
+            FakeAttachment(
+                filename="too_big.png",
+                content_type="image/png",
+                payload=b"x",
+                size=MAX_IMAGE_BYTES + 1,
+            ),
+        ],
+        reference=SimpleNamespace(message_id=555, resolved=None),
+        channel=SimpleNamespace(fetch_message=fetch_message),
+    )
+
+    collected = await bot._collect_message_images(msg)
+    assert len(collected) == 2
+    assert collected[0].mime_type == "image/png"
+    assert base64.b64decode(collected[0].data_base64) == b"own-img"
+    assert collected[1].mime_type == "image/jpeg"
+    assert base64.b64decode(collected[1].data_base64) == b"ref-img"
 
 
 @pytest.mark.asyncio
