@@ -1,9 +1,11 @@
-"""Discord bot implementation with slash commands and Gemini AI chat."""
+"""Discord bot implementation with slash commands and streaming Gemini AI chat."""
 
 from __future__ import annotations
 
 import logging
 import re
+import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
 
@@ -17,6 +19,9 @@ from src.utils import split_message
 
 
 logger = logging.getLogger(__name__)
+
+STREAM_EDIT_INTERVAL_SECONDS = 0.8
+STREAM_TYPING_INDICATOR = " ..."
 
 
 def make_session_key(channel_id: int, user_id: int) -> str:
@@ -49,8 +54,20 @@ def format_uptime(started_at: datetime, now: datetime | None = None) -> str:
     return " ".join(parts)
 
 
+def build_stream_preview(text: str, *, finished: bool = False) -> str:
+    """Build a safe <=2000-character preview of the first message while streaming."""
+    chunks = split_message(text, max_length=1880)
+    if not chunks:
+        return "(Mình không nhận được nội dung phản hồi từ mô hình.)" if finished else "..."
+
+    first_chunk = chunks[0]
+    if finished:
+        return first_chunk
+    return f"{first_chunk}{STREAM_TYPING_INDICATOR}"
+
+
 class DiscordGeminiBot(commands.Bot):
-    """Discord bot combining utility slash commands and Gemini AI chat."""
+    """Discord bot combining utility slash commands and streaming Gemini AI chat."""
 
     def __init__(
         self,
@@ -67,6 +84,7 @@ class DiscordGeminiBot(commands.Bot):
             api_key=config.gemini_api_key,
             model=config.gemini_model,
             system_instruction=config.system_instruction,
+            thinking_level=config.thinking_level,
         )
         self._commands_registered = False
 
@@ -82,6 +100,7 @@ class DiscordGeminiBot(commands.Bot):
             "uptime": format_uptime(self.started_at),
             "ai_enabled": self.ai_service.is_configured,
             "model": self.config.gemini_model,
+            "thinking_level": self.config.thinking_level or "default",
         }
 
     async def setup_hook(self) -> None:
@@ -101,15 +120,66 @@ class DiscordGeminiBot(commands.Bot):
 
     async def on_ready(self) -> None:
         """Log connection status and set bot presence."""
-        logger.info("Bot online as %s (ID: %s) in %d server(s)", self.user, self.user.id if self.user else "?", len(self.guilds))
+        logger.info(
+            "Bot online as %s (ID: %s) in %d server(s)",
+            self.user,
+            self.user.id if self.user else "?",
+            len(self.guilds),
+        )
         activity = discord.Activity(
             type=discord.ActivityType.listening,
             name="/ask & @mention",
         )
         await self.change_presence(status=discord.Status.online, activity=activity)
 
+    async def _stream_reply(
+        self,
+        session_key: str,
+        prompt: str,
+        send_initial: Callable[[str], Awaitable[Any]],
+        edit_message: Callable[[Any, str], Awaitable[Any]],
+        send_extra: Callable[[str], Awaitable[Any]],
+    ) -> None:
+        """Stream Gemini text deltas and progressively update the Discord response."""
+        buffer: list[str] = []
+        sent_message: Any | None = None
+        last_rendered = ""
+        last_edit_at = 0.0
+
+        async for delta in self.ai_service.stream_ask(session_key, prompt):
+            buffer.append(delta)
+            accumulated = "".join(buffer)
+            if not accumulated.strip():
+                continue
+
+            now = time.monotonic()
+            if sent_message is None:
+                preview = build_stream_preview(accumulated, finished=False)
+                sent_message = await send_initial(preview)
+                last_rendered = preview
+                last_edit_at = now
+            elif now - last_edit_at >= STREAM_EDIT_INTERVAL_SECONDS:
+                preview = build_stream_preview(accumulated, finished=False)
+                if preview != last_rendered:
+                    await edit_message(sent_message, preview)
+                    last_rendered = preview
+                    last_edit_at = now
+
+        final_text = "".join(buffer).strip()
+        chunks = split_message(final_text) or [
+            "(Mình không nhận được nội dung phản hồi từ mô hình.)"
+        ]
+
+        if sent_message is None:
+            sent_message = await send_initial(chunks[0])
+        elif chunks[0] != last_rendered:
+            await edit_message(sent_message, chunks[0])
+
+        for extra_chunk in chunks[1:]:
+            await send_extra(extra_chunk)
+
     async def on_message(self, message: discord.Message) -> None:
-        """Reply with Gemini AI when mentioned in a server or messaged in DM."""
+        """Reply with streaming Gemini AI when mentioned in a server or messaged in DM."""
         if message.author.bot:
             return
 
@@ -138,24 +208,21 @@ class DiscordGeminiBot(commands.Bot):
         session_key = make_session_key(message.channel.id, message.author.id)
         try:
             async with message.channel.typing():
-                answer = await self.ai_service.ask(session_key, prompt)
+                await self._stream_reply(
+                    session_key=session_key,
+                    prompt=prompt,
+                    send_initial=lambda text: message.reply(text, mention_author=False),
+                    edit_message=lambda msg, text: msg.edit(content=text),
+                    send_extra=lambda text: message.channel.send(text),
+                )
         except GeminiNotConfiguredError as exc:
             await message.reply(str(exc), mention_author=False)
-            return
         except Exception:
             logger.exception("Failed to generate Gemini response for message %s", message.id)
             await message.reply(
                 "Xin lỗi, mình gặp lỗi khi gọi Gemini AI. Vui lòng thử lại sau ít phút.",
                 mention_author=False,
             )
-            return
-
-        chunks = split_message(answer)
-        for index, chunk in enumerate(chunks):
-            if index == 0:
-                await message.reply(chunk, mention_author=False)
-            else:
-                await message.channel.send(chunk)
 
     def _register_commands(self) -> None:
         """Attach slash commands to the bot's CommandTree."""
@@ -182,6 +249,11 @@ class DiscordGeminiBot(commands.Bot):
             embed.add_field(name="Số server", value=str(len(self.guilds)), inline=True)
             embed.add_field(name="Gemini AI", value=ai_status, inline=True)
             embed.add_field(name="Model", value=f"`{self.config.gemini_model}`", inline=True)
+            embed.add_field(
+                name="Thinking",
+                value=f"`{self.config.thinking_level or 'default'}`",
+                inline=True,
+            )
             await interaction.response.send_message(embed=embed)
 
         @self.tree.command(name="ask", description="Hỏi Gemini AI bất kỳ điều gì")
@@ -194,25 +266,32 @@ class DiscordGeminiBot(commands.Bot):
             prompt: str,
             private: bool = False,
         ) -> None:
-            await interaction.response.defer(ephemeral=private, thinking=True)
+            try:
+                await interaction.response.defer(ephemeral=private, thinking=True)
+            except discord.NotFound:
+                logger.warning("Interaction %s expired before defer()", interaction.id)
+                return
+
             session_key = make_session_key(interaction.channel_id or 0, interaction.user.id)
 
             try:
-                answer = await self.ai_service.ask(session_key, prompt)
+                await self._stream_reply(
+                    session_key=session_key,
+                    prompt=prompt,
+                    send_initial=lambda text: interaction.followup.send(
+                        text, ephemeral=private, wait=True
+                    ),
+                    edit_message=lambda msg, text: msg.edit(content=text),
+                    send_extra=lambda text: interaction.followup.send(text, ephemeral=private),
+                )
             except GeminiNotConfiguredError as exc:
                 await interaction.followup.send(str(exc), ephemeral=private)
-                return
             except Exception:
                 logger.exception("Failed to handle /ask command")
                 await interaction.followup.send(
                     "Xin lỗi, mình gặp lỗi khi gọi Gemini AI. Vui lòng thử lại sau.",
                     ephemeral=private,
                 )
-                return
-
-            chunks = split_message(answer)
-            for chunk in chunks:
-                await interaction.followup.send(chunk, ephemeral=private)
 
         @self.tree.command(name="reset", description="Xóa ngữ cảnh hội thoại AI của bạn ở kênh này")
         async def reset_command(interaction: discord.Interaction) -> None:
@@ -233,7 +312,7 @@ class DiscordGeminiBot(commands.Bot):
         async def help_command(interaction: discord.Interaction) -> None:
             embed = discord.Embed(
                 title="Hướng dẫn sử dụng Bot",
-                description="Bot hỗ trợ cả **Slash Commands** và **chat trực tiếp với Gemini AI**.",
+                description="Bot hỗ trợ cả **Slash Commands** và **chat trực tiếp với Gemini AI** (phản hồi streaming).",
                 color=discord.Color.green(),
             )
             embed.add_field(

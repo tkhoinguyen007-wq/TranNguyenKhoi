@@ -21,6 +21,7 @@ class BotConfig:
     discord_token: str
     gemini_api_key: str | None
     gemini_model: str
+    thinking_level: str | None
     system_instruction: str
     guild_id: int | None
     port: int
@@ -33,6 +34,10 @@ class BotConfig:
         discord_token = os.getenv("DISCORD_TOKEN", "").strip()
         gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip() or None
         gemini_model = os.getenv("GEMINI_MODEL", "gemini-4-hydrogen").strip() or "gemini-4-hydrogen"
+
+        raw_thinking = os.getenv("GEMINI_THINKING_LEVEL", "low").strip().lower()
+        thinking_level = None if raw_thinking in ("", "none", "default") else raw_thinking
+
         system_instruction = (
             os.getenv("BOT_SYSTEM_INSTRUCTION", DEFAULT_SYSTEM_INSTRUCTION).strip()
             or DEFAULT_SYSTEM_INSTRUCTION
@@ -56,6 +61,7 @@ class BotConfig:
             discord_token=discord_token,
             gemini_api_key=gemini_api_key,
             gemini_model=gemini_model,
+            thinking_level=thinking_level,
             system_instruction=system_instruction,
             guild_id=guild_id,
             port=port,
