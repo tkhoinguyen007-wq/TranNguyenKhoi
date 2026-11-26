@@ -641,8 +641,7 @@ class DiscordGeminiBot(commands.Bot):
                 value=(
                     "`/teach <nội dung>` — Dạy kiến thức mới cho bot\n"
                     "`/knowledge` — Xem các kiến thức bot đang nhớ\n"
-                    "`/forget <id | all>` — Xóa kiến thức theo ID hoặc xóa hết\n"
-                    "**Chat DM trực tuyến (`_ngkhoi.9999`)**: `dạy: <nội dung>`, `nhớ: <nội dung>`, `xem kiến thức`, `quên: <id | all>`"
+                    "`/forget <id | all>` — Xóa kiến thức theo ID hoặc xóa hết"
                 ),
                 inline=False,
             )
